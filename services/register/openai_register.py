@@ -127,6 +127,36 @@ def _make_trace_headers() -> dict[str, str]:
     }
 
 
+def _reset_auth_session(session: requests.Session, device_id: str) -> None:
+    """Clear auth cookies and re-set device ID to reset auth state machine."""
+    for cookie in list(session.cookies):
+        if "auth.openai.com" in cookie.domain:
+            session.cookies.clear(domain=cookie.domain, path=cookie.path, name=cookie.name)
+    session.cookies.set("oai-did", device_id, domain=".auth.openai.com")
+    session.cookies.set("oai-did", device_id, domain="auth.openai.com")
+
+
+def _extract_code_from_session_cookie(session: requests.Session) -> str | None:
+    """Extract OAuth authorization code from the auth session cookie."""
+    for cookie_name in ("oai-client-auth-session", "auth0", "session"):
+        raw = session.cookies.get(cookie_name, domain=".auth.openai.com") or session.cookies.get(cookie_name)
+        if not raw or len(str(raw)) < 10:
+            continue
+        raw_str = str(raw)
+        if "." in raw_str:
+            try:
+                first_part = raw_str.split(".")[0]
+                padding = 4 - len(first_part) % 4
+                if padding != 4:
+                    first_part += "=" * padding
+                payload = json.loads(base64.urlsafe_b64decode(first_part))
+                if payload.get("code"):
+                    return str(payload["code"])
+            except Exception:
+                pass
+    return None
+
+
 def _generate_pkce() -> tuple[str, str]:
     code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode("ascii")
     code_challenge = base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
@@ -378,8 +408,11 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
         verify=False,
         timeout=60,
     )
+    if resp.status_code == 409:
+        print(f"[oauth_token] 409 invalid_state: {resp.text[:200]}")
+        return None
     if resp.status_code != 200:
-        print(resp.text)
+        print(f"[oauth_token] HTTP {resp.status_code}: {resp.text[:200]}")
         return None
     return _response_json(resp)
 
@@ -430,9 +463,27 @@ class PlatformRegistrar:
             "code_challenge_method": "S256",
             "auth0Client": platform_auth0_client,
         }
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
-        if resp is None or resp.status_code != 200:
-            err = _response_json(resp).get("error", {}) if resp is not None else {}
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+            if resp is None:
+                if attempt < max_retries - 1:
+                    step(index, f"platform_authorize 请求失败，重试 ({attempt + 1}/{max_retries})")
+                    time.sleep(2)
+                    continue
+                raise RuntimeError(error or "platform_authorize_request_failed")
+            if resp.status_code == 200:
+                break
+            if resp.status_code == 409 and attempt < max_retries - 1:
+                step(index, f"platform_authorize 返回 409，重试 ({attempt + 1}/{max_retries})")
+                _reset_auth_session(self.session, self.device_id)
+                self.code_verifier, code_challenge = _generate_pkce()
+                params["code_challenge"] = code_challenge
+                params["state"] = secrets.token_urlsafe(32)
+                time.sleep(1)
+                continue
+            err = _response_json(resp).get("error", {})
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
             if _is_cloudflare_challenge(resp):
                 raise RuntimeError("被 Cloudflare 拦截，请更换 IP 重试")
@@ -445,9 +496,22 @@ class PlatformRegistrar:
         step(index, "开始提交注册密码")
         headers = self._json_headers(f"{auth_base}/create-account/password")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create")
-        resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
-        if resp is None or resp.status_code != 200:
-            data = _response_json(resp) if resp is not None else {}
+        max_retries = 3
+        for attempt in range(max_retries):
+            resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
+            if resp is None:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                raise RuntimeError(error or "user_register_request_failed")
+            if resp.status_code == 200:
+                break
+            if resp.status_code == 409 and attempt < max_retries - 1:
+                step(index, f"提交注册密码返回 409，重试 ({attempt + 1}/{max_retries})")
+                _reset_auth_session(self.session, self.device_id)
+                time.sleep(1)
+                continue
+            data = _response_json(resp)
             if data.get("message") == "Failed to create account. Please try again.":
                 step(index, "注册失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
@@ -456,46 +520,130 @@ class PlatformRegistrar:
 
     def _send_otp(self, index: int) -> None:
         step(index, "开始发送验证码")
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=self._navigate_headers(f"{auth_base}/create-account/password"), allow_redirects=True, verify=False)
-        if resp is None or resp.status_code not in (200, 302):
+        max_retries = 3
+        for attempt in range(max_retries):
+            resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=self._navigate_headers(f"{auth_base}/create-account/password"), allow_redirects=True, verify=False)
+            if resp is None:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                raise RuntimeError(error or "send_otp_request_failed")
+            if resp.status_code == 409 and attempt < max_retries - 1:
+                step(index, f"发送验证码返回 409，重试 ({attempt + 1}/{max_retries})")
+                _reset_auth_session(self.session, self.device_id)
+                time.sleep(1)
+                continue
+            if resp.status_code in (200, 302):
+                break
             raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}")
         step(index, "发送验证码完成")
 
     def _validate_otp(self, code: str, index: int) -> None:
         step(index, f"开始校验验证码 {code}")
-        resp, error = validate_otp(self.session, self.device_id, code)
-        if resp is None or resp.status_code != 200:
+        max_retries = 3
+        last_error = ""
+        for attempt in range(max_retries):
+            resp, error = validate_otp(self.session, self.device_id, code)
+            if resp is not None and resp.status_code == 200:
+                break
+            last_error = error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}"
+            if attempt < max_retries - 1:
+                step(index, f"验证码校验失败，重试 ({attempt + 1}/{max_retries})")
+                time.sleep(1)
+                continue
             body = ""
             try:
                 body = (resp.text or "")[:500] if resp is not None else ""
             except Exception:
                 pass
-            raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}_body={body}")
+            raise RuntimeError(last_error + (f"_body={body}" if body else ""))
         step(index, "验证码校验完成")
 
     def _create_account(self, name: str, birthdate: str, index: int) -> None:
         step(index, "开始创建账号资料")
         headers = self._json_headers(f"{auth_base}/about-you")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
-        resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
-        if resp is None or resp.status_code not in (200, 302):
-            data = _response_json(resp) if resp is not None else {}
+        max_retries = 3
+        for attempt in range(max_retries):
+            resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
+            if resp is None:
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
+                raise RuntimeError(error or "create_account_request_failed")
+            if resp.status_code in (200, 302):
+                break
+            if resp.status_code == 409 and attempt < max_retries - 1:
+                step(index, f"创建账号资料返回 409，重试 ({attempt + 1}/{max_retries})")
+                _reset_auth_session(self.session, self.device_id)
+                time.sleep(1)
+                continue
+            data = _response_json(resp)
             if data.get("message") == "Failed to create account. Please try again.":
                 step(index, "创建账号失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
+
         data = _response_json(resp)
-        callback_params = extract_oauth_callback_params_from_url(str(data.get("continue_url") or "").strip())
+        continue_url = str(data.get("continue_url") or "").strip()
+        callback_params = extract_oauth_callback_params_from_url(continue_url)
         self.platform_auth_code = str((callback_params or {}).get("code") or "").strip()
+        if not self.platform_auth_code:
+            self.platform_auth_code = _extract_code_from_session_cookie(self.session) or ""
+        if not self.platform_auth_code:
+            step(index, "警告: 未能从 continue_url 或 session cookie 中提取 OAuth code，尝试从重定向中提取", "yellow")
+            for hist in getattr(resp, "history", []) or []:
+                loc = str(hist.headers.get("Location") or "").strip()
+                cb = extract_oauth_callback_params_from_url(loc)
+                if cb and cb.get("code"):
+                    self.platform_auth_code = str(cb["code"]).strip()
+                    break
         step(index, "创建账号资料完成")
 
     def _exchange_registered_tokens(self, index: int) -> dict:
         step(index, "开始换 token")
-        tokens = request_platform_oauth_token(self.session, self.platform_auth_code, self.code_verifier)
-        if not tokens:
-            raise RuntimeError("token换取失败")
-        step(index, "token 换取完成")
-        return tokens
+        max_retries = 3
+        last_error = ""
+        for attempt in range(max_retries):
+            tokens = request_platform_oauth_token(self.session, self.platform_auth_code, self.code_verifier)
+            if tokens:
+                step(index, "token 换取完成")
+                return tokens
+            last_error = f"token换取失败 (attempt {attempt + 1}/{max_retries})"
+            if attempt < max_retries - 1:
+                step(index, f"token换取返回空，尝试用 session cookie 重新提取 code 并重试 ({attempt + 1}/{max_retries})")
+                extracted_code = _extract_code_from_session_cookie(self.session)
+                if extracted_code:
+                    self.platform_auth_code = extracted_code
+                    time.sleep(1)
+                    continue
+                step(index, f"无法从 session cookie 提取 code，重新 authorize ({attempt + 1}/{max_retries})")
+                _reset_auth_session(self.session, self.device_id)
+                new_verifier, new_challenge = _generate_pkce()
+                params = {
+                    "issuer": auth_base,
+                    "client_id": platform_oauth_client_id,
+                    "audience": platform_oauth_audience,
+                    "redirect_uri": platform_oauth_redirect_uri,
+                    "device_id": self.device_id,
+                    "screen_hint": "signup",
+                    "max_age": "0",
+                    "scope": "openid profile email offline_access",
+                    "response_type": "code",
+                    "response_mode": "query",
+                    "state": secrets.token_urlsafe(32),
+                    "nonce": secrets.token_urlsafe(32),
+                    "code_challenge": new_challenge,
+                    "code_challenge_method": "S256",
+                    "auth0Client": platform_auth0_client,
+                }
+                resp, _ = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+                if resp is not None and resp.status_code == 200:
+                    cb = extract_oauth_callback_params_from_url(str(resp.url))
+                    self.platform_auth_code = str((cb or {}).get("code") or "").strip()
+                self.code_verifier = new_verifier
+                time.sleep(1)
+        raise RuntimeError(last_error)
 
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
